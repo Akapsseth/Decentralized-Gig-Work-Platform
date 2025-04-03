@@ -421,3 +421,157 @@
         (ok true)
     )
 )
+
+;; Add Constants
+(define-constant premium-fee-monthly u1000) ;; in STX tokens
+(define-constant premium-blocks-monthly u4320) ;; ~30 days in blocks
+
+;; Add to Data Maps
+(define-map premium-workers
+    { worker: principal }
+    {
+        premium-until: uint,
+        subscription-tier: (string-ascii 10), ;; "basic", "silver", "gold"
+        benefits: (list 5 (string-ascii 20)),
+        auto-renew: bool
+    }
+)
+
+;; Add Public Function
+(define-public (subscribe-premium (tier (string-ascii 10)) (auto-renew bool))
+    (let
+        ((fee (if (is-eq tier "gold")
+                (* premium-fee-monthly u3)
+                (if (is-eq tier "silver")
+                   (* premium-fee-monthly u2)
+                   premium-fee-monthly)))
+         (duration (if (is-eq tier "gold")
+                      (* premium-blocks-monthly u3)
+                      (if (is-eq tier "silver")
+                         (* premium-blocks-monthly u2)
+                         premium-blocks-monthly)))
+         (benefits (if (is-eq tier "gold")
+                      (list "priority" "featured" "discount" "badge" "analytics")
+                      (if (is-eq tier "silver")
+                         (list "priority" "featured" "discount")
+                         (list "priority")))))
+        
+        ;; Transfer premium fee to contract
+        (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
+        
+        ;; Set premium status
+        (map-set premium-workers
+            { worker: tx-sender }
+            {
+                premium-until: (+ stacks-block-height duration),
+                subscription-tier: tier,
+                benefits: benefits,
+                auto-renew: auto-renew
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (cancel-premium-subscription)
+    (let
+        ((premium-status (unwrap! (map-get? premium-workers { worker: tx-sender }) (err u1100))))
+        
+        (map-set premium-workers
+            { worker: tx-sender }
+            (merge premium-status { auto-renew: false })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (is-premium-worker (worker principal))
+    (let
+        ((premium-status (map-get? premium-workers { worker: worker })))
+        (if (is-some premium-status)
+            (< stacks-block-height (get premium-until (unwrap! premium-status false)))
+            false
+        )
+    )
+)
+
+
+
+;; Add Constants
+(define-constant referral-bonus-percentage u5) ;; 5% bonus
+(define-constant max-referrals-per-user u10)
+
+;; Add to Data Maps
+(define-map referral-tracking
+    { referrer: principal }
+    {
+        referred-users: (list 10 principal),
+        total-earnings: uint,
+        active-referrals: uint
+    }
+)
+
+(define-public (claim-referral-bonus (referred-user principal))
+    (let
+        ((current-referrals (default-to 
+            { referred-users: (list ), total-earnings: u0, active-referrals: u0 }
+            (map-get? referral-tracking { referrer: tx-sender }))))
+        
+        (asserts! (< (get active-referrals current-referrals) max-referrals-per-user) (err u1300))
+        
+        (map-set referral-tracking
+            { referrer: tx-sender }
+            {
+                referred-users: (unwrap! (as-max-len? 
+                    (append (get referred-users current-referrals) referred-user)
+                    u10) 
+                    (err u1301)),
+                total-earnings: (get total-earnings current-referrals),
+                active-referrals: (+ (get active-referrals current-referrals) u1)
+            }
+        )
+        (ok true)
+    )
+)
+
+
+
+;; Add Constants
+(define-constant early-bird-discount u10) ;; 10% discount
+(define-constant rush-hour-premium u20) ;; 20% premium
+
+;; Add to Data Maps
+(define-map gig-pricing-rules
+    { gig-id: uint }
+    {
+        base-price: uint,
+        early-bird-ends: uint,
+        rush-hour-starts: uint,
+        current-price: uint
+    }
+)
+
+(define-public (set-dynamic-pricing 
+    (gig-id uint)
+    (early-bird-duration uint)
+    (rush-hour-start uint))
+    
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) (err err-not-found))))
+        (asserts! (is-eq tx-sender (get owner gig)) (err err-owner-only))
+        
+        (map-set gig-pricing-rules
+            { gig-id: gig-id }
+            {
+                base-price: (get payment gig),
+                early-bird-ends: (+ stacks-block-height early-bird-duration),
+                rush-hour-starts: (+ stacks-block-height rush-hour-start),
+                current-price: (get payment gig)
+            }
+        )
+        (ok true)
+    )
+)
+
