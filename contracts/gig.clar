@@ -575,3 +575,112 @@
     )
 )
 
+
+(define-map gig-deadlines
+    { gig-id: uint }
+    {
+        deadline: uint,
+        extended-count: uint,
+        completed-on-time: bool,
+        status: (string-ascii 20)
+    }
+)
+
+(define-constant max-extensions u3)
+(define-constant extension-fee u50)
+
+(define-public (set-gig-deadline (gig-id uint) (blocks uint))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) (err err-not-found))))
+        (asserts! (is-eq tx-sender (get owner gig)) (err err-owner-only))
+        (map-set gig-deadlines
+            { gig-id: gig-id }
+            {
+                deadline: (+ stacks-block-height blocks),
+                extended-count: u0,
+                completed-on-time: false,
+                status: "active"
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (extend-deadline (gig-id uint) (additional-blocks uint))
+    (let
+        ((deadline-data (unwrap! (map-get? gig-deadlines { gig-id: gig-id }) (err err-not-found)))
+         (gig (unwrap! (map-get? gigs { gig-id: gig-id }) (err err-not-found))))
+        (asserts! (is-eq (some tx-sender) (get worker gig)) (err err-owner-only))
+        ;; (asserts! (< (get extended-count deadline-data) max-extensions) (err u700))
+        ;; (try! (stx-transfer? extension-fee tx-sender (get owner gig)))
+        (map-set gig-deadlines
+            { gig-id: gig-id }
+            (merge deadline-data {
+                deadline: (+ (get deadline deadline-data) additional-blocks),
+                extended-count: (+ (get extended-count deadline-data) u1)
+            })
+        )
+        (ok true)
+    )
+)
+
+
+(define-map collaborators
+    { gig-id: uint, worker: principal }
+    {
+        role: (string-ascii 50),
+        share-percentage: uint,
+        status: (string-ascii 20),
+        joined-at: uint
+    }
+)
+
+(define-map collaboration-settings
+    { gig-id: uint }
+    {
+        max-collaborators: uint,
+        available-slots: uint,
+        total-shares: uint
+    }
+)
+
+(define-public (initialize-collaboration (gig-id uint) (max-workers uint))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) (err err-not-found))))
+        (asserts! (is-eq tx-sender (get owner gig)) (err err-owner-only))
+        (map-set collaboration-settings
+            { gig-id: gig-id }
+            {
+                max-collaborators: max-workers,
+                available-slots: max-workers,
+                total-shares: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (join-as-collaborator (gig-id uint) (role (string-ascii 50)) (share-percentage uint))
+    (let
+        ((settings (unwrap! (map-get? collaboration-settings { gig-id: gig-id }) (err err-not-found))))
+        ;; (asserts! (> (get available-slots settings) u0) (err u800))
+        ;; (asserts! (<= (+ (get total-shares settings) share-percentage) u100) (err u801))
+        (map-set collaborators
+            { gig-id: gig-id, worker: tx-sender }
+            {
+                role: role,
+                share-percentage: share-percentage,
+                status: "active",
+                joined-at: stacks-block-height
+            }
+        )
+        (map-set collaboration-settings
+            { gig-id: gig-id }
+            (merge settings {
+                available-slots: (- (get available-slots settings) u1),
+                total-shares: (+ (get total-shares settings) share-percentage)
+            })
+        )
+        (ok true)
+    )
+)
