@@ -7,6 +7,21 @@
 (define-constant err-already-exists (err u102))
 (define-constant err-gig-closed (err u103))
 
+(define-constant err-insufficient-funds (err u200))
+(define-constant err-funds-locked (err u201))
+(define-constant err-already-funded (err u202))
+(define-constant err-not-funded (err u203))
+
+(define-map escrow-funds
+    { gig-id: uint }
+    {
+        amount: uint,
+        funded: bool,
+        locked: bool,
+        funder: principal
+    }
+)
+
 ;; Data Maps
 (define-map gigs 
     { gig-id: uint }
@@ -682,5 +697,76 @@
             })
         )
         (ok true)
+    )
+)
+
+
+
+(define-public (fund-escrow (gig-id uint))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (existing-escrow (map-get? escrow-funds { gig-id: gig-id })))
+        (asserts! (is-eq tx-sender (get owner gig)) err-owner-only)
+        (asserts! (is-none existing-escrow) err-already-funded)
+        (try! (stx-transfer? (get payment gig) tx-sender (as-contract tx-sender)))
+        (map-set escrow-funds
+            { gig-id: gig-id }
+            {
+                amount: (get payment gig),
+                funded: true,
+                locked: true,
+                funder: tx-sender
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (release-escrow-payment (gig-id uint))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (escrow (unwrap! (map-get? escrow-funds { gig-id: gig-id }) err-not-funded)))
+        (asserts! (is-eq tx-sender (get owner gig)) err-owner-only)
+        (asserts! (get completed gig) (err u400))
+        (asserts! (get funded escrow) err-not-funded)
+        (asserts! (get locked escrow) err-funds-locked)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (unwrap! (get worker gig) err-not-found))))
+        (map-set escrow-funds
+            { gig-id: gig-id }
+            (merge escrow { locked: false })
+        )
+        (map-set gigs
+            { gig-id: gig-id }
+            (merge gig { paid: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (refund-escrow (gig-id uint))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (escrow (unwrap! (map-get? escrow-funds { gig-id: gig-id }) err-not-funded)))
+        (asserts! (is-eq tx-sender (get owner gig)) err-owner-only)
+        (asserts! (is-none (get worker gig)) (err u405))
+        (asserts! (get funded escrow) err-not-funded)
+        (asserts! (get locked escrow) err-funds-locked)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get funder escrow))))
+        (map-set escrow-funds
+            { gig-id: gig-id }
+            (merge escrow { locked: false })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow-status (gig-id uint))
+    (map-get? escrow-funds { gig-id: gig-id })
+)
+
+(define-read-only (is-gig-funded (gig-id uint))
+    (match (map-get? escrow-funds { gig-id: gig-id })
+        escrow (get funded escrow)
+        false
     )
 )
