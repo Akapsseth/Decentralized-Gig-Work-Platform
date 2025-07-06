@@ -770,3 +770,187 @@
         false
     )
 )
+
+(define-constant auto-release-delay u144)
+(define-constant verification-required u2)
+
+(define-map milestone-payments
+    { gig-id: uint, milestone-id: uint }
+    {
+        amount: uint,
+        description: (string-ascii 200),
+        deliverable-hash: (string-ascii 64),
+        escrow-funded: bool,
+        worker-verified: bool,
+        client-verified: bool,
+        auto-release-block: uint,
+        payment-released: bool,
+        disputed: bool
+    }
+)
+
+(define-map milestone-escrows
+    { gig-id: uint, milestone-id: uint }
+    {
+        amount: uint,
+        locked: bool,
+        funder: principal
+    }
+)
+
+(define-map milestone-counter
+    { gig-id: uint }
+    { count: uint }
+)
+
+(define-public (create-milestone-payment 
+    (gig-id uint) 
+    (amount uint) 
+    (description (string-ascii 200)))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (current-count (default-to { count: u0 } (map-get? milestone-counter { gig-id: gig-id })))
+         (new-milestone-id (+ (get count current-count) u1)))
+        (asserts! (is-eq tx-sender (get owner gig)) err-owner-only)
+        (asserts! (is-some (get worker gig)) (err u900))
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set milestone-payments
+            { gig-id: gig-id, milestone-id: new-milestone-id }
+            {
+                amount: amount,
+                description: description,
+                deliverable-hash: "",
+                escrow-funded: true,
+                worker-verified: false,
+                client-verified: false,
+                auto-release-block: u0,
+                payment-released: false,
+                disputed: false
+            }
+        )
+        (map-set milestone-escrows
+            { gig-id: gig-id, milestone-id: new-milestone-id }
+            {
+                amount: amount,
+                locked: true,
+                funder: tx-sender
+            }
+        )
+        (map-set milestone-counter { gig-id: gig-id } { count: new-milestone-id })
+        (ok new-milestone-id)
+    )
+)
+
+(define-public (submit-milestone-deliverable 
+    (gig-id uint) 
+    (milestone-id uint) 
+    (deliverable-hash (string-ascii 64)))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (milestone (unwrap! (map-get? milestone-payments { gig-id: gig-id, milestone-id: milestone-id }) err-not-found)))
+        (asserts! (is-eq (some tx-sender) (get worker gig)) err-owner-only)
+        (asserts! (get escrow-funded milestone) (err u901))
+        (asserts! (not (get payment-released milestone)) (err u902))
+        (map-set milestone-payments
+            { gig-id: gig-id, milestone-id: milestone-id }
+            (merge milestone {
+                deliverable-hash: deliverable-hash,
+                worker-verified: true,
+                auto-release-block: (+ stacks-block-height auto-release-delay)
+            })
+        )
+        (ok true)
+    )
+)
+
+
+(define-public (claim-auto-release-payment 
+    (gig-id uint) 
+    (milestone-id uint))
+    (let
+        ((milestone (unwrap! (map-get? milestone-payments { gig-id: gig-id, milestone-id: milestone-id }) err-not-found)))
+        (asserts! (> stacks-block-height (get auto-release-block milestone)) (err u904))
+        (asserts! (get worker-verified milestone) (err u903))
+        (asserts! (not (get client-verified milestone)) (err u905))
+        (asserts! (not (get payment-released milestone)) (err u902))
+        (asserts! (not (get disputed milestone)) (err u906))
+        (try! (release-milestone-payment-internal gig-id milestone-id))
+        (ok true)
+    )
+)
+
+(define-public (dispute-milestone 
+    (gig-id uint) 
+    (milestone-id uint) 
+    (reason (string-ascii 500)))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (milestone (unwrap! (map-get? milestone-payments { gig-id: gig-id, milestone-id: milestone-id }) err-not-found)))
+        (asserts! (or (is-eq tx-sender (get owner gig)) 
+                     (is-eq (some tx-sender) (get worker gig))) err-owner-only)
+        (asserts! (get worker-verified milestone) (err u903))
+        (asserts! (not (get payment-released milestone)) (err u902))
+        (map-set milestone-payments
+            { gig-id: gig-id, milestone-id: milestone-id }
+            (merge milestone { disputed: true })
+        )
+        (map-set disputes
+            { gig-id: gig-id }
+            {
+                complainant: tx-sender,
+                description: reason,
+                resolved: false
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-private (release-milestone-payment-internal 
+    (gig-id uint) 
+    (milestone-id uint))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found))
+         (milestone (unwrap! (map-get? milestone-payments { gig-id: gig-id, milestone-id: milestone-id }) err-not-found))
+         (escrow (unwrap! (map-get? milestone-escrows { gig-id: gig-id, milestone-id: milestone-id }) err-not-found)))
+        (asserts! (get locked escrow) (err u907))
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (unwrap! (get worker gig) err-not-found))))
+        (map-set milestone-payments
+            { gig-id: gig-id, milestone-id: milestone-id }
+            (merge milestone { payment-released: true })
+        )
+        (map-set milestone-escrows
+            { gig-id: gig-id, milestone-id: milestone-id }
+            (merge escrow { locked: false })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone-status 
+    (gig-id uint) 
+    (milestone-id uint))
+    (map-get? milestone-payments { gig-id: gig-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-milestone-escrow 
+    (gig-id uint) 
+    (milestone-id uint))
+    (map-get? milestone-escrows { gig-id: gig-id, milestone-id: milestone-id })
+)
+
+(define-read-only (can-auto-release 
+    (gig-id uint) 
+    (milestone-id uint))
+    (let
+        ((milestone (map-get? milestone-payments { gig-id: gig-id, milestone-id: milestone-id })))
+        (match milestone
+            m (and (get worker-verified m)
+                  (not (get client-verified m))
+                  (not (get disputed m))
+                  (not (get payment-released m))
+                  (> stacks-block-height (get auto-release-block m)))
+            false
+        )
+    )
+)
