@@ -52,6 +52,6 @@ plan:
         - emulated-contract-publish:
             contract-name: gig
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/gig.clar
+            path: "contracts\\gig.clar"
             clarity-version: 3
       epoch: "3.1"
