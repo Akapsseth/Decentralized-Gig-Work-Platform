@@ -771,6 +771,331 @@
     )
 )
 
+;; === SKILL VERIFICATION AND CERTIFICATION SYSTEM ===
+
+;; Constants for skill verification
+(define-constant certification-fee u50) ;; Fee to take a skill assessment
+(define-constant evaluator-reward u25) ;; Reward for evaluators per assessment
+(define-constant passing-score u70) ;; Minimum score to pass (out of 100)
+(define-constant max-attempts u3) ;; Maximum attempts per skill challenge
+
+;; Data structures for skill challenges created by evaluators
+(define-map skill-challenges
+    { challenge-id: uint }
+    {
+        evaluator: principal,
+        skill-name: (string-ascii 30),
+        description: (string-ascii 200),
+        max-score: uint,
+        active: bool,
+        created-at: uint,
+        difficulty-level: (string-ascii 10), ;; "beginner", "intermediate", "advanced"
+        estimated-duration: uint ;; in minutes
+    }
+)
+
+;; Track individual assessment attempts by workers
+(define-map skill-assessments
+    { worker: principal, challenge-id: uint, attempt: uint }
+    {
+        score: uint,
+        passed: bool,
+        submitted-at: uint,
+        evaluated-at: uint,
+        evaluator-notes: (string-ascii 300)
+    }
+)
+
+;; Store verified certifications earned by workers
+(define-map worker-certifications
+    { worker: principal, skill-name: (string-ascii 30) }
+    {
+        challenge-id: uint,
+        score: uint,
+        certified-at: uint,
+        evaluator: principal,
+        expiry-block: uint,
+        certification-level: (string-ascii 10) ;; based on score ranges
+    }
+)
+
+;; Track worker's attempts per challenge
+(define-map assessment-attempts
+    { worker: principal, challenge-id: uint }
+    { attempts-used: uint }
+)
+
+;; Evaluator performance and reputation tracking
+(define-map evaluator-stats
+    { evaluator: principal }
+    {
+        challenges-created: uint,
+        assessments-conducted: uint,
+        average-rating: uint,
+        total-earnings: uint,
+        certified-evaluator: bool
+    }
+)
+
+;; Required certifications for specific gigs
+(define-map gig-certification-requirements
+    { gig-id: uint }
+    { required-skills: (list 5 (string-ascii 30)) }
+)
+
+;; Global counters
+(define-map challenge-counter
+    { dummy: uint }
+    { count: uint }
+)
+
+;; Create a new skill challenge (only for certified evaluators)
+(define-public (create-skill-challenge 
+    (skill-name (string-ascii 30))
+    (description (string-ascii 200))
+    (max-score uint)
+    (difficulty-level (string-ascii 10))
+    (estimated-duration uint))
+    (let
+        ((current-count (default-to { count: u0 } (map-get? challenge-counter { dummy: u0 })))
+         (new-challenge-id (+ (get count current-count) u1))
+         (evaluator-info (default-to 
+            { challenges-created: u0, assessments-conducted: u0, average-rating: u0, total-earnings: u0, certified-evaluator: false }
+            (map-get? evaluator-stats { evaluator: tx-sender }))))
+        
+        ;; Only certified evaluators or contract owner can create challenges
+        (asserts! (or (get certified-evaluator evaluator-info) 
+                     (is-eq tx-sender contract-owner)) (err u1400))
+        (asserts! (> max-score u0) (err u1401))
+        
+        ;; Create the challenge
+        (map-set skill-challenges
+            { challenge-id: new-challenge-id }
+            {
+                evaluator: tx-sender,
+                skill-name: skill-name,
+                description: description,
+                max-score: max-score,
+                active: true,
+                created-at: stacks-block-height,
+                difficulty-level: difficulty-level,
+                estimated-duration: estimated-duration
+            }
+        )
+        
+        ;; Update counters
+        (map-set challenge-counter { dummy: u0 } { count: new-challenge-id })
+        (map-set evaluator-stats
+            { evaluator: tx-sender }
+            (merge evaluator-info { challenges-created: (+ (get challenges-created evaluator-info) u1) })
+        )
+        
+        (ok new-challenge-id)
+    )
+)
+
+;; Submit assessment attempt for a skill challenge
+(define-public (submit-skill-assessment 
+    (challenge-id uint)
+    (self-reported-score uint))
+    (let
+        ((challenge (unwrap! (map-get? skill-challenges { challenge-id: challenge-id }) (err u1402)))
+         (attempt-record (default-to { attempts-used: u0 } 
+            (map-get? assessment-attempts { worker: tx-sender, challenge-id: challenge-id })))
+         (next-attempt (+ (get attempts-used attempt-record) u1)))
+        
+        ;; Validation checks
+        (asserts! (get active challenge) (err u1403))
+        (asserts! (<= next-attempt max-attempts) (err u1404))
+        (asserts! (<= self-reported-score (get max-score challenge)) (err u1405))
+        
+        ;; Pay assessment fee
+        (try! (stx-transfer? certification-fee tx-sender (get evaluator challenge)))
+        
+        ;; Record the assessment attempt
+        (map-set skill-assessments
+            { worker: tx-sender, challenge-id: challenge-id, attempt: next-attempt }
+            {
+                score: self-reported-score,
+                passed: (>= (* self-reported-score u100) (* passing-score (get max-score challenge))),
+                submitted-at: stacks-block-height,
+                evaluated-at: u0,
+                evaluator-notes: ""
+            }
+        )
+        
+        ;; Update attempt counter
+        (map-set assessment-attempts
+            { worker: tx-sender, challenge-id: challenge-id }
+            { attempts-used: next-attempt }
+        )
+        
+        (ok next-attempt)
+    )
+)
+
+;; Evaluator confirms and finalizes assessment score
+(define-public (evaluate-assessment 
+    (worker principal)
+    (challenge-id uint)
+    (attempt uint)
+    (final-score uint)
+    (evaluator-notes (string-ascii 300)))
+    (let
+        ((challenge (unwrap! (map-get? skill-challenges { challenge-id: challenge-id }) (err u1402)))
+         (assessment (unwrap! (map-get? skill-assessments { worker: worker, challenge-id: challenge-id, attempt: attempt }) (err u1406)))
+         (evaluator-info (default-to 
+            { challenges-created: u0, assessments-conducted: u0, average-rating: u0, total-earnings: u0, certified-evaluator: false }
+            (map-get? evaluator-stats { evaluator: tx-sender })))
+         (passed (>= (* final-score u100) (* passing-score (get max-score challenge))))
+         (certification-level (if (>= final-score (* (get max-score challenge) u90))
+                                 "expert"
+                                 (if (>= final-score (* (get max-score challenge) u80))
+                                    "advanced"
+                                    "certified"))))
+        
+        ;; Only the challenge creator can evaluate
+        (asserts! (is-eq tx-sender (get evaluator challenge)) (err u1407))
+        (asserts! (is-eq (get evaluated-at assessment) u0) (err u1408)) ;; Not already evaluated
+        (asserts! (<= final-score (get max-score challenge)) (err u1405))
+        
+        ;; Update assessment with final evaluation
+        (map-set skill-assessments
+            { worker: worker, challenge-id: challenge-id, attempt: attempt }
+            (merge assessment {
+                score: final-score,
+                passed: passed,
+                evaluated-at: stacks-block-height,
+                evaluator-notes: evaluator-notes
+            })
+        )
+        
+        ;; If passed, issue certification
+        (if passed
+            (map-set worker-certifications
+                { worker: worker, skill-name: (get skill-name challenge) }
+                {
+                    challenge-id: challenge-id,
+                    score: final-score,
+                    certified-at: stacks-block-height,
+                    evaluator: tx-sender,
+                    expiry-block: (+ stacks-block-height u52560), ;; ~1 year validity
+                    certification-level: certification-level
+                }
+            )
+            true
+        )
+        
+        ;; Pay evaluator reward
+        (try! (as-contract (stx-transfer? evaluator-reward tx-sender tx-sender)))
+        
+        ;; Update evaluator stats
+        (map-set evaluator-stats
+            { evaluator: tx-sender }
+            (merge evaluator-info { 
+                assessments-conducted: (+ (get assessments-conducted evaluator-info) u1),
+                total-earnings: (+ (get total-earnings evaluator-info) evaluator-reward)
+            })
+        )
+        
+        (ok passed)
+    )
+)
+
+;; Set required certifications for a gig
+(define-public (set-gig-certification-requirements 
+    (gig-id uint)
+    (required-skills (list 5 (string-ascii 30))))
+    (let
+        ((gig (unwrap! (map-get? gigs { gig-id: gig-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get owner gig)) err-owner-only)
+        (map-set gig-certification-requirements
+            { gig-id: gig-id }
+            { required-skills: required-skills }
+        )
+        (ok true)
+    )
+)
+
+;; Check if worker meets certification requirements for a gig
+(define-public (verify-worker-certifications 
+    (worker principal)
+    (gig-id uint))
+    (let
+        ((requirements (map-get? gig-certification-requirements { gig-id: gig-id })))
+        (match requirements
+            req (ok (check-all-certifications worker (get required-skills req)))
+            (ok true) ;; No requirements set
+        )
+    )
+)
+
+;; Helper function to check if worker has all required certifications
+(define-private (check-all-certifications 
+    (worker principal)
+    (skills (list 5 (string-ascii 30))))
+    (fold check-single-certification skills true)
+)
+
+(define-private (check-single-certification 
+    (skill (string-ascii 30))
+    (all-valid bool))
+    (let
+        ((cert (map-get? worker-certifications { worker: tx-sender, skill-name: skill })))
+        (match cert
+            c (and all-valid (< stacks-block-height (get expiry-block c)))
+            false
+        )
+    )
+)
+
+;; Certify an evaluator (only contract owner)
+(define-public (certify-evaluator (evaluator principal))
+    (let
+        ((evaluator-info (default-to 
+            { challenges-created: u0, assessments-conducted: u0, average-rating: u0, total-earnings: u0, certified-evaluator: false }
+            (map-get? evaluator-stats { evaluator: evaluator }))))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set evaluator-stats
+            { evaluator: evaluator }
+            (merge evaluator-info { certified-evaluator: true })
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions for skill verification system
+
+(define-read-only (get-skill-challenge (challenge-id uint))
+    (map-get? skill-challenges { challenge-id: challenge-id })
+)
+
+(define-read-only (get-worker-certification (worker principal) (skill-name (string-ascii 30)))
+    (map-get? worker-certifications { worker: worker, skill-name: skill-name })
+)
+
+(define-read-only (get-assessment-result (worker principal) (challenge-id uint) (attempt uint))
+    (map-get? skill-assessments { worker: worker, challenge-id: challenge-id, attempt: attempt })
+)
+
+(define-read-only (get-evaluator-stats (evaluator principal))
+    (map-get? evaluator-stats { evaluator: evaluator })
+)
+
+(define-read-only (get-gig-requirements (gig-id uint))
+    (map-get? gig-certification-requirements { gig-id: gig-id })
+)
+
+(define-read-only (is-certification-valid (worker principal) (skill-name (string-ascii 30)))
+    (let
+        ((cert (map-get? worker-certifications { worker: worker, skill-name: skill-name })))
+        (match cert
+            c (< stacks-block-height (get expiry-block c))
+            false
+        )
+    )
+)
+
 (define-constant auto-release-delay u144)
 (define-constant verification-required u2)
 
@@ -954,3 +1279,4 @@
         )
     )
 )
+
